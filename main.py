@@ -446,7 +446,7 @@ class QBittorrentLoadBalancer:
             """尝试更新实例状态的内部函数"""
             maindata = instance.client.sync_maindata()
             self._update_instance_metrics(instance, maindata)
-            self._process_instance_announces(instance, maindata)
+            #self._process_instance_announces(instance, maindata)
             #self._add_peers_for_retry_torrents(instance, maindata)
             #self._save_torrent_peers_to_csv(instance, maindata)
         
@@ -639,7 +639,7 @@ class QBittorrentLoadBalancer:
                         reason.append("发现tracker错误信息")
 
                     # 2. 检查Peer数量
-                    if torrent.progress < 0.8 and torrent.num_leechs < 3:
+                    if torrent.progress < 0.8 and torrent.num_leechs < 2:
                         needs_announce = True
                         reason.append(f"Peer数量不足({torrent.num_leechs})")
 
