@@ -30,6 +30,7 @@
     "primary_sort_key": "upload_speed",
     "log_dir": "./logs",
     "debug_add_stopped": false,
+    "fast_announce_enabled": false,
     "fast_announce_category_blacklist": [
         "redacted",
         "xxxxxxxx"

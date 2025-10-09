@@ -446,7 +446,7 @@ class QBittorrentLoadBalancer:
             """尝试更新实例状态的内部函数"""
             maindata = instance.client.sync_maindata()
             self._update_instance_metrics(instance, maindata)
-            #self._process_instance_announces(instance, maindata)
+            self._process_instance_announces(instance, maindata)
             #self._add_peers_for_retry_torrents(instance, maindata)
             #self._save_torrent_peers_to_csv(instance, maindata)
         
@@ -549,6 +549,10 @@ class QBittorrentLoadBalancer:
         """处理实例的种子汇报检查"""
         # 如果debug_add_stopped为True，直接返回，不做任何处理
         if self.config.get('debug_add_stopped', False):
+            return
+            
+        # 如果快速汇报开关未启用，直接返回，不做任何处理
+        if not self.config.get('fast_announce_enabled', False):
             return
 
         max_retries = self.config.get('max_announce_retries', 12)

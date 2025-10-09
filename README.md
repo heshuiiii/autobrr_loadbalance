@@ -78,7 +78,10 @@ python run.py
 | `fast_announce_interval` | `3` | 快速检查间隔（2-10秒），正常检查为2倍该值 |
 | `connection_timeout` | `6` | 连接超时时间（秒）|
 | `debug_add_stopped` | `false` | 调试模式：新种子暂停添加 |
+| `fast_announce_enabled` | `false` | 快速汇报模式开关，谨慎使用 |
 | `fast_announce_category_blacklist` | `[]` | 快速汇报分类黑名单，指定分类的种子不触发快速汇报 |
+
+⚠️ 警告：fast_announce_enabled打开可能会导致你的账号被站点警告、封禁等后果，如果你打开，责任自负
 
 ### 可选配置（流量监控）
 
