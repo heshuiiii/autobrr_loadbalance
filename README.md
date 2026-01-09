@@ -1,3 +1,6 @@
+# 增加了一个新功能
+设置了一个api端点用于https://github.com/heshuiiii/Hetzner-cloudRecreate 配合自动修改config.json的ip自动刷新下载器连接
+
 # qBittorrent 智能负载均衡器
 
 为 qBittorrent 多实例设计的智能负载均衡器，通过 webhook 接收 [autobrr](https://github.com/autobrr/autobrr) 的种子添加请求，自动分配到最优实例。
