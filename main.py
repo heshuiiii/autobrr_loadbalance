@@ -2,6 +2,7 @@
 """
 qBittorrent Load Balancer
 监控torrent文件并智能分配到多个qBittorrent实例
+支持从 Hetzner 监控接收 IP 变更通知并自动更新配置
 """
 
 import json
@@ -14,8 +15,10 @@ import requests
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field
-
+import hashlib
+from pathlib import Path
 import qbittorrentapi
+from flask import Flask, request, jsonify
 from webhook_server import WebhookServer
 
 
@@ -152,22 +155,301 @@ class PendingTorrent:
     category: Optional[str] = None
 
 
+class ConfigManager:
+    """🆕 配置文件管理器 - 负责读取和更新 config.json"""
+    def __init__(self, config_file: str = DEFAULT_CONFIG_FILE):
+        self.config_file = config_file
+        self.config_lock = threading.Lock()
+    
+    def load_config(self) -> dict:
+        """加载配置文件"""
+        try:
+            with open(self.config_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            logger.error(f"配置文件未找到：{self.config_file}")
+            raise
+        except json.JSONDecodeError:
+            logger.error(f"配置文件格式错误：{self.config_file}")
+            raise
+    
+    def save_config(self, config: dict) -> bool:
+        """保存配置文件"""
+        try:
+            with self.config_lock:
+                # 先备份原配置
+                backup_file = f"{self.config_file}.backup"
+                if os.path.exists(self.config_file):
+                    import shutil
+                    shutil.copy2(self.config_file, backup_file)
+                
+                # 写入新配置
+                with open(self.config_file, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, indent=2, ensure_ascii=False)
+                
+                logger.info(f"✓ 配置文件已更新：{self.config_file}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"✗ 保存配置文件失败：{e}")
+            return False
+    
+    def extract_ip_from_url(self, url: str) -> Optional[str]:
+        """
+        从 URL 中提取 IP 地址或主机名
+        支持多种格式：
+        - http://46.224.213.76:9090 → 46.224.213.76
+        - http://111:9090 → 111
+        - http://localhost:9090 → localhost
+        - http://qb-server:9090 → qb-server
+        """
+        import re
+        
+        # 方法1: 尝试匹配完整 IPv4 地址
+        ipv4_pattern = r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
+        match = re.search(ipv4_pattern, url)
+        if match:
+            return match.group(1)
+        
+        # 方法2: 提取 host:port 格式中的 host 部分
+        # 匹配 http(s)://host:port 或 http(s)://host
+        host_pattern = r'https?://([^:/]+)'
+        match = re.search(host_pattern, url)
+        if match:
+            return match.group(1)
+        
+        logger.warning(f"无法从 URL 中提取 IP/主机名: {url}")
+        return None
+    
+    def update_instance_ip(self, old_ip: str, new_ip: str) -> Dict[str, any]:
+        """
+        🆕 优化版IP更新逻辑：
+        1. 如果只提供new_ip（初始创建场景），找第一个占位符实例更新
+        2. 如果提供old_ip和new_ip，执行替换
+        3. 如果new_ip已存在，跳过
+        """
+        try:
+            config = self.load_config()
+            instances = config.get('qbittorrent_instances', [])
+            
+            # 1. 检查 new_ip 是否已存在
+            for instance in instances:
+                current_host = self.extract_ip_from_url(instance.get('url', ''))
+                if current_host == new_ip:
+                    logger.info(f"ℹ IP {new_ip} 已存在于实例 {instance.get('name')} 中")
+                    return {'success': True, 'updated_count': 0, 'message': f'IP {new_ip} 已存在'}
+            
+            # 2. 确定要更新的目标实例
+            target_instance = None
+            
+            # 如果提供了old_ip，优先匹配old_ip
+            if old_ip:
+                for instance in instances:
+                    current_host = self.extract_ip_from_url(instance.get('url', ''))
+                    if current_host == old_ip:
+                        target_instance = instance
+                        logger.info(f"🎯 匹配到旧IP ({old_ip}) 的实例: {instance.get('name')}")
+                        break
+            
+            # 如果没有匹配到old_ip，或者没有提供old_ip（初始创建场景）
+            if not target_instance:
+                # 收集所有当前有效的IP
+                current_ips = set()
+                for inst in instances:
+                    ip = self.extract_ip_from_url(inst.get('url', ''))
+                    if ip and self._is_valid_ip(ip):
+                        current_ips.add(ip)
+                
+                # 找第一个使用占位符或无效IP的实例
+                for instance in instances:
+                    current_host = self.extract_ip_from_url(instance.get('url', ''))
+                    if not current_host or not self._is_valid_ip(current_host):
+                        target_instance = instance
+                        logger.info(f"📝 找到占位符实例进行更新: {instance.get('name')}")
+                        break
+            
+            # 3. 执行更新
+            if target_instance:
+                old_url = target_instance['url']
+                current_host = self.extract_ip_from_url(old_url)
+                
+                if current_host:
+                    new_url = old_url.replace(current_host, new_ip)
+                else:
+                    # 如果无法提取host，重构URL
+                    import re
+                    port_match = re.search(r':(\d+)', old_url)
+                    port = port_match.group(1) if port_match else '9090'
+                    new_url = f"http://{new_ip}:{port}"
+                
+                target_instance['url'] = new_url
+                
+                if self.save_config(config):
+                    logger.info(f"✅ 已更新实例 {target_instance.get('name')}: {old_url} → {new_url}")
+                    return {
+                        'success': True,
+                        'updated_count': 1,
+                        'updated_instances': [{
+                            'name': target_instance.get('name'),
+                            'old_url': old_url,
+                            'new_url': new_url
+                        }],
+                        'message': f'成功更新到 {new_ip}'
+                    }
+            
+            logger.warning("⚠ 未找到合适的实例进行更新")
+            return {'success': True, 'updated_count': 0, 'message': '未找到合适的更新目标'}
+                
+        except Exception as e:
+            logger.error(f"✗ 更新实例IP失败：{e}")
+            return {'success': False, 'error': str(e)}
+
+    def _is_valid_ip(self, ip: str) -> bool:
+        """检查是否为有效的IPv4地址"""
+        import re
+        pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+        if not re.match(pattern, ip):
+            return False
+        # 验证每个数字在0-255范围内
+        parts = ip.split('.')
+        return all(0 <= int(part) <= 255 for part in parts)
+    
+    def check_ip_exists(self, ip: str) -> bool:
+        """检查配置中是否存在指定IP"""
+        try:
+            config = self.load_config()
+            instances = config.get('qbittorrent_instances', [])
+            
+            for instance in instances:
+                url = instance.get('url', '')
+                # 使用增强的提取方法
+                current_host = self.extract_ip_from_url(url)
+                if current_host == ip or ip in url:
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"检查IP存在性失败：{e}")
+            return False
+
+
+class ConfigWatcher:
+    """配置文件监控器 - 检测 config.json 变化并触发热重载"""
+    
+    def __init__(self, config_file: str, check_interval: int = 5):
+        """
+        初始化监控器
+        
+        Args:
+            config_file: 配置文件路径
+            check_interval: 检查间隔（秒）
+        """
+        self.config_file = Path(config_file)
+        self.check_interval = check_interval
+        self.last_hash = self._get_file_hash()
+        self.callbacks = []
+        self.running = False
+        self.watch_thread = None
+        
+    def _get_file_hash(self) -> str:
+        """计算配置文件的哈希值"""
+        try:
+            if not self.config_file.exists():
+                return ""
+            
+            with open(self.config_file, 'rb') as f:
+                return hashlib.md5(f.read()).hexdigest()
+        except Exception as e:
+            logger.error(f"计算文件哈希失败: {e}")
+            return ""
+    
+    def register_callback(self, callback):
+        """注册配置变化时的回调函数"""
+        self.callbacks.append(callback)
+        logger.debug(f"已注册配置变化回调: {callback.__name__}")
+    
+    def _notify_change(self):
+        """通知所有回调函数配置已变化"""
+        logger.info(f"🔥 检测到配置文件变化，触发 {len(self.callbacks)} 个回调")
+        for callback in self.callbacks:
+            try:
+                callback()
+            except Exception as e:
+                logger.error(f"执行回调失败: {callback.__name__}, 错误: {e}")
+    
+    def _watch_loop(self):
+        """监控循环"""
+        logger.info(f"📂 配置文件监控已启动，检查间隔: {self.check_interval}秒")
+        
+        while self.running:
+            try:
+                current_hash = self._get_file_hash()
+                
+                if current_hash and current_hash != self.last_hash:
+                    logger.info(f"🔔 配置文件已更新: {self.config_file}")
+                    self.last_hash = current_hash
+                    time.sleep(0.5)  # 等待文件写入完成
+                    self._notify_change()
+                
+                time.sleep(self.check_interval)
+                
+            except Exception as e:
+                logger.error(f"配置监控异常: {e}")
+                time.sleep(self.check_interval)
+    
+    def start(self):
+        """启动监控"""
+        if self.running:
+            logger.warning("配置监控已在运行中")
+            return
+        
+        self.running = True
+        self.watch_thread = threading.Thread(
+            target=self._watch_loop,
+            daemon=True,
+            name="config-watcher"
+        )
+        self.watch_thread.start()
+        logger.info("✓ 配置文件监控线程已启动")
+    
+    def stop(self):
+        """停止监控"""
+        self.running = False
+        if self.watch_thread:
+            self.watch_thread.join(timeout=2)
+        logger.info("配置文件监控已停止")
+
+
 class QBittorrentLoadBalancer:
     """qBittorrent负载均衡器"""
     
     def __init__(self, config_file: str = DEFAULT_CONFIG_FILE):
-        self.config = self._load_config(config_file)        
+        self.config_manager = ConfigManager(config_file)
+        self.config = self.config_manager.load_config()
         self.instances: List[InstanceInfo] = []
         self.pending_torrents: List[PendingTorrent] = []
         self.pending_torrents_lock = threading.Lock()
         self.instances_lock = threading.Lock()
-        self.announce_retry_counts = {} # 用于跟踪每个种子的汇报重试次数
+        self.announce_retry_counts = {}
         
-        # 重新配置日志（支持文件输出）
+        # 重新配置日志
         self._setup_logging()
         
         # 初始化webhook服务器
         self.webhook_server: Optional[WebhookServer] = None
+        
+        # 初始化 Flask API 服务器
+        self.api_server: Optional[Flask] = None
+        self.api_port = self.config.get('api_port', 5007)
+        
+        # 🆕 初始化配置文件监控器
+        self.config_watcher = ConfigWatcher(
+            config_file=config_file,
+            check_interval=self.config.get('config_watch_interval', 5)
+        )
+        # 注册配置变化时的回调
+        self.config_watcher.register_callback(self._on_config_changed)
         
         self._setup_environment()
         
@@ -192,12 +474,95 @@ class QBittorrentLoadBalancer:
         self._validate_config()
         # 设置配置默认值和验证
         self._set_config_defaults()
-        # 初始化qBittorrent实例
-        self._init_instances()
         
-        # 启动webhook服务器
+        # 🆕 优先启动 API 服务器和 Webhook 服务器（立即可用）
+        self._start_api_server()
         self._start_webhook_server()
         
+        # 异步初始化 qBittorrent 实例（不阻塞启动）
+        self._init_instances_async()
+    def _on_config_changed(self):
+        """配置文件变化时的处理函数（热重载核心逻辑）"""
+        logger.info("="*70)
+        logger.info("🔥 开始热重载配置...")
+        logger.info("="*70)
+        
+        try:
+            # 1. 重新加载配置文件
+            new_config = self.config_manager.load_config()
+            logger.info("✓ 配置文件已重新读取")
+            
+            # 2. 比对实例配置的变化
+            old_instances = {inst['name']: inst for inst in self.config.get('qbittorrent_instances', [])}
+            new_instances = {inst['name']: inst for inst in new_config.get('qbittorrent_instances', [])}
+            
+            # 3. 更新内存中的实例配置
+            instances_changed = False
+            with self.instances_lock:
+                for instance in self.instances:
+                    if instance.name in new_instances:
+                        new_conf = new_instances[instance.name]
+                        old_conf = old_instances.get(instance.name, {})
+                        
+                        # 🔥 关键修改：比对新配置和内存中的实例URL（而不是旧配置）
+                        if new_conf['url'] != instance.url:
+                            old_url = instance.url
+                            instance.url = new_conf['url']
+                            instance.username = new_conf['username']
+                            instance.password = new_conf['password']
+                            instance.is_connected = False
+                            instances_changed = True
+                            
+                            logger.info(f"🔄 实例 {instance.name} URL 已变更:")
+                            logger.info(f"   旧: {old_url}")
+                            logger.info(f"   新: {instance.url}")
+                            
+                            # 立即触发重连
+                            self._async_reconnect_single_instance(instance)
+                        
+                        # 检查认证信息是否变化
+                        elif (new_conf.get('username') != instance.username or
+                            new_conf.get('password') != instance.password):
+                            instance.username = new_conf['username']
+                            instance.password = new_conf['password']
+                            instance.is_connected = False
+                            instances_changed = True
+                            logger.info(f"🔑 实例 {instance.name} 认证信息已变更，触发重连")
+                            self._async_reconnect_single_instance(instance)
+                        else:
+                            logger.debug(f"✓ 实例 {instance.name} 配置无变化")
+            
+            # 4. 更新全局配置
+            self.config = new_config
+            logger.info("✓ 全局配置已更新")
+            
+            if not instances_changed:
+                logger.info("ℹ️  本次配置变更未涉及实例URL或认证信息")
+            
+            logger.info("="*70)
+            logger.info("🎉 配置热重载完成")
+            logger.info("="*70)
+            
+        except Exception as e:
+            logger.error(f"❌ 配置热重载失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+
+    def _async_reconnect_single_instance(self, instance: InstanceInfo):
+        """异步重连单个实例（不阻塞主线程）"""
+        def reconnect():
+            time.sleep(1)  # 等待1秒确保配置稳定
+            logger.info(f"🔌 开始重连实例: {instance.name}")
+            self._connect_instance(instance)
+        
+        threading.Thread(
+            target=reconnect,
+            daemon=True,
+            name=f"reconnect-{instance.name}"
+        ).start()
+
+
     def _validate_config(self) -> None:
         """验证配置文件的有效性"""
         # 验证primary_sort_key配置
@@ -234,16 +599,8 @@ class QBittorrentLoadBalancer:
             logger.info("未配置快速汇报分类黑名单，所有分类都将执行快速汇报")
             
     def _load_config(self, config_file: str) -> dict:
-        """加载配置文件"""
-        try:
-            with open(config_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except FileNotFoundError:
-            logger.error(f"配置文件未找到：{config_file}")
-            raise
-        except json.JSONDecodeError:
-            logger.error(f"配置文件格式错误：{config_file}")
-            raise
+        """加载配置文件（已被 ConfigManager 替代）"""
+        return self.config_manager.load_config()
     
     def _set_config_defaults(self) -> None:
         """设置配置默认值和验证"""
@@ -257,11 +614,32 @@ class QBittorrentLoadBalancer:
         logger.info(f"状态更新间隔配置：快速检查={fast_interval}秒，正常检查={fast_interval * 2}秒")
 
     def _init_instances(self) -> None:
-        """初始化qBittorrent实例连接"""
+        """初始化qBittorrent实例连接（同步版本 - 会阻塞）"""
         for instance_config in self.config['qbittorrent_instances']:
             instance = self._create_instance_from_config(instance_config)
             self._connect_instance(instance)
             self.instances.append(instance)
+    
+    def _init_instances_async(self) -> None:
+        """🆕 异步初始化qBittorrent实例连接（不阻塞启动）"""
+        logger.info("🔄 开始异步初始化 qBittorrent 实例...")
+        
+        # 先创建所有实例对象（不连接）
+        for instance_config in self.config['qbittorrent_instances']:
+            instance = self._create_instance_from_config(instance_config)
+            instance.is_connected = False
+            self.instances.append(instance)
+            logger.info(f"📝 已加载实例配置: {instance.name} ({instance.url})")
+        
+        # 在后台线程中连接实例
+        def connect_instances():
+            logger.info("🔌 开始连接 qBittorrent 实例...")
+            for instance in self.instances:
+                self._connect_instance(instance)
+            logger.info("✅ qBittorrent 实例初始化完成")
+        
+        connect_thread = threading.Thread(target=connect_instances, daemon=True, name="init-instances")
+        connect_thread.start()
             
     def _create_instance_from_config(self, config: Dict[str, str]) -> InstanceInfo:
         """根据配置创建实例信息对象"""
@@ -401,6 +779,162 @@ class QBittorrentLoadBalancer:
         except Exception as e:
             logger.error(f"启动webhook服务器失败: {e}")
             raise
+    
+    def _start_api_server(self) -> None:
+        """🆕 启动Flask API服务器"""
+        try:
+            logger.info(f"🚀 正在初始化API服务器...")
+            
+            self.api_server = Flask('qb_loadbalancer_api')
+            self.api_server.logger.disabled = True
+            
+            # 禁用 Werkzeug 日志
+            import logging as werkzeug_logging
+            werkzeug_log = werkzeug_logging.getLogger('werkzeug')
+            werkzeug_log.setLevel(werkzeug_logging.ERROR)
+            
+            @self.api_server.route('/api/update-ip', methods=['POST'])
+            def update_ip():
+                """接收Hetzner监控的IP变更通知"""
+                try:
+                    data = request.get_json()
+                    if not data:
+                        return jsonify({'success': False, 'error': 'No JSON data'}), 400
+                    
+                    new_ip = data.get('new_ip')
+                    old_ip = data.get('old_ip')  # 可选
+                    
+                    if not new_ip:
+                        return jsonify({
+                            'success': False,
+                            'error': 'Missing new_ip'
+                        }), 400
+                    
+                    if old_ip:
+                        logger.info(f"📡 收到IP变更通知: {old_ip} → {new_ip}")
+                    else:
+                        logger.info(f"📡 收到新IP通知: {new_ip}")
+                    
+                    # 先检查新IP是否已存在
+                    if self.config_manager.check_ip_exists(new_ip):
+                        logger.info(f"✓ IP {new_ip} 已存在于配置中，无需更新")
+                        return jsonify({
+                            'success': True,
+                            'updated_count': 0,
+                            'message': f'IP {new_ip} 已存在'
+                        })
+                    
+                    # 更新配置文件
+                    result = self.config_manager.update_instance_ip(old_ip, new_ip)
+                    
+                    if result['success'] and result['updated_count'] > 0:
+                        # 🔥 关键修改：先更新内存中的实例，再重新加载配置
+                        updated_instances = []
+                        with self.instances_lock:
+                            for instance in self.instances:
+                                current_host = self.config_manager.extract_ip_from_url(instance.url)
+                                
+                                # 方式1: 如果提供了old_ip，精确匹配替换
+                                if old_ip and current_host == old_ip:
+                                    old_url = instance.url
+                                    instance.url = instance.url.replace(old_ip, new_ip)
+                                    instance.is_connected = False
+                                    updated_instances.append(instance)
+                                    logger.info(f"🔄 已更新实例 {instance.name}: {old_url} → {instance.url}")
+                                
+                                # 方式2: 如果没有提供old_ip，更新第一个无效IP的实例
+                                elif not old_ip and (not current_host or not self.config_manager._is_valid_ip(current_host)):
+                                    old_url = instance.url
+                                    instance.url = instance.url.replace(current_host if current_host else '111', new_ip)
+                                    instance.is_connected = False
+                                    updated_instances.append(instance)
+                                    logger.info(f"🔄 已更新实例 {instance.name}: {old_url} → {instance.url}")
+                                    break  # 只更新第一个
+                        
+                        # 然后重新加载配置（保持一致性）
+                        self.config = self.config_manager.load_config()
+                        logger.info(f"🔄 配置已重新加载")
+                        
+                        # 异步触发重连
+                        def reconnect_instances():
+                            time.sleep(1)  # 等待1秒确保配置稳定
+                            for instance in updated_instances:
+                                logger.info(f"🔌 触发实例重连: {instance.name}")
+                                self._connect_instance(instance)
+                        
+                        reconnect_thread = threading.Thread(
+                            target=reconnect_instances, 
+                            daemon=True, 
+                            name="api-reconnect"
+                        )
+                        reconnect_thread.start()
+                        
+                        logger.info(f"✓ IP更新完成，共更新 {result['updated_count']} 个实例")
+                    
+                    return jsonify(result)
+                    
+                except Exception as e:
+                    logger.error(f"✗ 处理IP更新请求失败：{e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    return jsonify({
+                        'success': False,
+                        'error': str(e)
+                    }), 500
+            
+            @self.api_server.route('/health', methods=['GET'])
+            def health_check():
+                """健康检查接口"""
+                return jsonify({
+                    'status': 'ok',
+                    'timestamp': datetime.now().isoformat(),
+                    'instances_connected': len([i for i in self.instances if i.is_connected])
+                })
+            
+            # 在独立线程中启动API服务器
+            def run_api():
+                try:
+                    logger.info(f"📡 API服务器线程启动中...")
+                    self.api_server.run(
+                        host='0.0.0.0',
+                        port=self.api_port,
+                        debug=False,
+                        use_reloader=False,
+                        threaded=True
+                    )
+                except Exception as e:
+                    logger.error(f"❌ API服务器运行失败: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+            
+            api_thread = threading.Thread(target=run_api, daemon=True, name="api-server")
+            api_thread.start()
+            
+            # 等待API服务器启动并验证
+            max_wait = 10
+            for i in range(max_wait):
+                time.sleep(1)
+                try:
+                    response = requests.get(f'http://localhost:{self.api_port}/health', timeout=2)
+                    if response.status_code == 200:
+                        logger.info(f"✅ API服务器启动成功并通过健康检查!")
+                        logger.info(f"🌐 监听地址: http://0.0.0.0:{self.api_port}")
+                        logger.info(f"📍 可用端点:")
+                        logger.info(f"   • POST /api/update-ip - 接收IP变更通知")
+                        logger.info(f"   • GET /health - 健康检查")
+                        return
+                except:
+                    if i < max_wait - 1:
+                        logger.debug(f"等待API服务器就绪... ({i+1}/{max_wait})")
+                    pass
+            
+            logger.warning(f"⚠️ API服务器可能未完全启动，但进程已运行")
+            logger.info(f"🌐 监听地址: http://0.0.0.0:{self.api_port}")
+            
+        except Exception as e:
+            logger.error(f"❌ 启动API服务器失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             
     def add_pending_torrent(self, download_url: str, release_name: str, category: Optional[str] = None) -> None:
         """添加待处理的torrent"""
@@ -447,8 +981,6 @@ class QBittorrentLoadBalancer:
             maindata = instance.client.sync_maindata()
             self._update_instance_metrics(instance, maindata)
             self._process_instance_announces(instance, maindata)
-            #self._add_peers_for_retry_torrents(instance, maindata)
-            #self._save_torrent_peers_to_csv(instance, maindata)
         
         # 第一次尝试
         try:
@@ -620,8 +1152,6 @@ class QBittorrentLoadBalancer:
                     # Filter out non-HTTP trackers and special trackers like DHT, PEX, LSD
                     filtered_trackers = []
                     for t in trackers:
-                        # DHT, PEX, and LSD are peer sources, not trackers. The API returns them
-                        # in the tracker list, but their 'url' is just a name like 'dht'.
                         if t.url.lower() in ('dht', 'pex', 'lsd'):
                             continue
                         if not t.url.startswith(('http://', 'https://')):
@@ -663,86 +1193,6 @@ class QBittorrentLoadBalancer:
                         f"尝试次数: {current_retries}")
         except Exception as e:
             logger.warning(f"汇报失败: {torrent.name}，错误: {e}")
-    
-    def _save_torrent_peers_to_csv(self, instance: InstanceInfo, maindata: dict) -> None:
-        """保存种子peer列表到CSV文件"""
-        all_torrents_items = maindata.get('torrents', {}).items()
-        
-        for torrent_hash, torrent in all_torrents_items:
-            # 检查种子是否在announce_retry_counts中
-            if torrent_hash not in self.announce_retry_counts:
-                continue
-                
-            # 检查种子状态是否为正在下载中
-            if torrent.state != 'downloading':
-                continue
-            
-            # 检查./logs目录中是否已有以此hash命名的csv文件
-            csv_filename = f"./logs/{torrent_hash}.csv"
-            if os.path.exists(csv_filename):
-                continue
-                
-            try:
-                # 获取种子的peer列表
-                # 使用qbittorrent-api库提供的官方方法
-                peers_data = instance.client.sync_torrent_peers(torrent_hash=torrent_hash)
-                peers = peers_data.get('peers', {})
-                
-                if not peers:
-                    logger.debug(f"种子 {torrent.name} 没有peer连接")
-                    continue
-                
-                # 确保logs目录存在
-                os.makedirs('./logs', exist_ok=True)
-                
-                # 保存peer信息到CSV文件
-                with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
-                    fieldnames = ['ip', 'port', 'client', 'country', 'downloaded', 'uploaded', 'progress']
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    
-                    # 写入表头
-                    writer.writeheader()
-                    
-                    # 写入peer数据
-                    for peer_id, peer_info in peers.items():
-                        writer.writerow({
-                            'ip': peer_info.get('ip', ''),
-                            'port': peer_info.get('port', ''),
-                            'client': peer_info.get('client', ''),
-                            'country': peer_info.get('country', ''),
-                            'downloaded': peer_info.get('downloaded', 0),
-                            'uploaded': peer_info.get('uploaded', 0),
-                            'progress': peer_info.get('progress', 0)
-                        })
-                
-                logger.info(f"已保存种子 {torrent.name} 的peer列表到 {csv_filename}，共 {len(peers)} 个peer")
-                
-            except Exception as e:
-                logger.warning(f"保存种子 {torrent.name} 的peer列表失败: {e}")
-                    
-
-    def _add_peers_for_retry_torrents(self, instance: InstanceInfo, maindata: dict) -> None:
-        """为重试次数为1的种子添加指定的peer"""
-        try:
-            # 预定义的peer列表
-            peers_to_add = ["213.227.151.211:30957", "45.87.251.103:58929"]
-            
-            # 获取当前实例的种子列表
-            torrents_in_instance = maindata.get('torrents', {})
-            
-            # 只处理当前实例中存在且重试次数为1的种子
-            for torrent_hash, retry_count in self.announce_retry_counts.items():
-                # 检查种子是否在当前实例中存在且重试次数为1
-                if retry_count == 1 and torrent_hash in torrents_in_instance:
-                    try:
-                        # 为种子添加peer
-                        instance.client.torrents_add_peers(torrent_hashes=torrent_hash, peers=peers_to_add)
-                        logger.info(f"已为种子 {torrent_hash} 添加peer: {', '.join(peers_to_add)} (实例: {instance.name})")
-                    except Exception as e:
-                        logger.warning(f"为种子 {torrent_hash} 添加peer失败：{e} (实例: {instance.name})")
-                        
-        except Exception as e:
-            logger.error(f"添加peer过程中发生错误：{instance.name}，错误：{e}")
 
 
     def _get_primary_sort_value(self, instance: InstanceInfo) -> float:
@@ -859,13 +1309,22 @@ class QBittorrentLoadBalancer:
             status_msg = f"实例状态: {connected_count}/{total_instances} 连接正常"
             if disconnected_instances:
                 status_msg += f", 断开连接: {', '.join(disconnected_instances)}"
-            # 移除待处理torrent数量，因为该信息10s更新一次时效性太差
             
             logger.debug(status_msg)
                 
     def status_update_thread(self) -> None:
         """状态更新线程"""
-        logger.info("状态更新线程启动")
+        # 等待初始连接完成（最多10秒）
+        logger.info("⏳ 等待实例初始化...")
+        for i in range(10):
+            time.sleep(1)
+            with self.instances_lock:
+                connected = sum(1 for inst in self.instances if inst.is_connected)
+                if connected > 0:
+                    logger.info(f"✓ 已连接 {connected}/{len(self.instances)} 个实例")
+                    break
+        
+        logger.info("🔄 状态监控线程开始运行")
         
         while True:
             try:
@@ -886,7 +1345,7 @@ class QBittorrentLoadBalancer:
                 
     def task_processor_thread(self) -> None:
         """任务处理线程"""
-        logger.info("任务处理线程启动")
+        logger.info("📦 任务处理线程开始运行")
         
         while True:
             try:
@@ -907,25 +1366,58 @@ class QBittorrentLoadBalancer:
                 
     def run(self) -> None:
         """运行负载均衡器"""
-        logger.info("qBittorrent负载均衡器启动")
+        logger.info("="*70)
+        logger.info("  qBittorrent 负载均衡器启动")
+        logger.info("="*70)
+        
+        # 显示配置摘要
+        logger.info(f"📋 配置摘要:")
+        logger.info(f"   • 实例数量: {len(self.instances)}")
+        logger.info(f"   • Webhook端口: {self.config.get('webhook_port', 5000)}")
+        logger.info(f"   • API端口: {self.api_port}")
+        logger.info(f"   • 日志目录: {self.config.get('log_dir', './logs')}")
+
+        self.config_watcher.start()
         
         # 启动状态更新线程
         status_thread = threading.Thread(target=self.status_update_thread, daemon=True)
         status_thread.start()
+        logger.info("✓ 状态更新线程已启动")
+
+        # 启动状态更新线程
+        status_thread = threading.Thread(target=self.status_update_thread, daemon=True)
+        status_thread.start()
+        logger.info("✓ 状态更新线程已启动")
         
         # 启动任务处理线程
         task_thread = threading.Thread(target=self.task_processor_thread, daemon=True)
         task_thread.start()
+        logger.info("✓ 任务处理线程已启动")
+        
+        logger.info("="*70)
+        logger.info("🚀 所有服务已启动，系统运行中...")
+        logger.info("💡 提示: 使用 Ctrl+C 停止程序")
+        logger.info("="*70)
         
         try:
             # 主线程保持运行
             while True:
                 time.sleep(DEFAULT_SLEEP_TIME)
         except KeyboardInterrupt:
-            logger.info("收到停止信号，正在关闭...")
+            logger.info("\n" + "="*70)
+            logger.info("🛑 收到停止信号，正在关闭...")
+            logger.info("="*70)
+            
+            # 🆕 停止配置监控
+            if self.config_watcher:
+                self.config_watcher.stop()
+                logger.info("✓ 配置监控已停止")
+            
             if self.webhook_server:
                 self.webhook_server.stop()
-                logger.info("Webhook服务器已停止")
+                logger.info("✓ Webhook服务器已停止")
+            
+            logger.info("✓ 程序已安全退出")
 
 
 def main() -> int:
@@ -940,4 +1432,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    exit(main()) 
+    exit(main())
